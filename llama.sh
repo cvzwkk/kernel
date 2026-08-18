@@ -96,7 +96,7 @@ VULKAN_SDK_DIR="$HOME/$(ls -d 1.3.*/ | head -n 1)x86_64"
 export VULKAN_SDK="$VULKAN_SDK_DIR"
 export LD_LIBRARY_PATH="$VULKAN_SDK/lib:$LD_LIBRARY_PATH"
 
-# Run server with RX 580 offload (-ngl 99), 4096 context, and 10 physical cores (-t 10)
+# Run server with offload (-ngl 99), 4096 context, and 10 physical cores (-t 10)
 ./build/bin/llama-server \
     -m "$MODEL_PATH" \
     -ngl 99 \
