@@ -19,13 +19,15 @@ log_message "INFO" "Starting Advanced Zero Trust Pipe Sentinel service..."
 
 while true; do
     # ----------------------------------------------------
-    # Method 1: Kernel & Systemd Journal Pipe Error Scan
+    # Method 1: Kernel & Systemd Journal Pipe Error Scan (Fixed)
     # ----------------------------------------------------
     BROKEN_PIPES=$(journalctl -k --since "10s ago" --grep="Broken pipe|EPIPE|sigpipe" --no-pager 2>/dev/null || true)
-    if [[ -n "$BROKEN_PIPES" ]]; then
+    
+    # Check that output is not empty and doesn't just indicate lack of entries
+    if [[ -n "$BROKEN_PIPES" ]] && [[ "$BROKEN_PIPES" != "-- No entries --" ]]; then
         log_message "WARN" "Kernel-level EPIPE / SIGPIPE event detected:"
         while IFS= read -r line; do
-            log_message "DETAIL" "$line"
+            [[ -n "$line" ]] && log_message "DETAIL" "$line"
         done <<< "$BROKEN_PIPES"
     fi
 
@@ -36,7 +38,7 @@ while true; do
     if [[ -n "$STALE_SOCKETS" ]]; then
         log_message "WARN" "Stale Unix domain sockets found (causes broken IPC pipes):"
         while IFS= read -r sock; do
-            log_message "FIX" "Removing dead socket link: $sock"
+            [[ -n "$sock" ]] && log_message "FIX" "Removing dead socket link: $sock"
             rm -f "$sock"
         done <<< "$STALE_SOCKETS"
     fi
@@ -44,7 +46,7 @@ while true; do
     # ----------------------------------------------------
     # Method 3: Monitor Hung/Close-Wait Socket Congestion
     # ----------------------------------------------------
-    CLOSE_WAIT_COUNT=$(ss -t -a 'state close-wait' 2>/dev/null | wc -l || echo 0)
+    CLOSE_WAIT_COUNT=$(ss -t -a 'state close-wait' 2>/dev/null | tail -n +2 | wc -l || echo 0)
     if [[ "$CLOSE_WAIT_COUNT" -gt 15 ]]; then
         log_message "WARN" "High count of CLOSE_WAIT sockets detected ($CLOSE_WAIT_COUNT). Potential hung IPC/network pipes."
     fi
@@ -56,7 +58,7 @@ while true; do
     if [[ -n "$ZOMBIES" ]]; then
         log_message "WARN" "Zombie processes detected holding block/pipe states:"
         while IFS= read -r zproc; do
-            log_message "DETAIL" "Zombie Process Info: $zproc"
+            [[ -n "$zproc" ]] && log_message "DETAIL" "Zombie Process Info: $zproc"
         done <<< "$ZOMBIES"
     fi
 
