@@ -5,6 +5,10 @@
 #include <glib/gstdio.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
+#include <openssl/crypto.h>
 
 #if defined(GDK_WINDOWING_X11)
 #include <gdk/gdkx.h>
@@ -126,109 +130,179 @@ log_security_event(SecurityEventType type,
 
 
 /* ============================================================
- *  DOMAIN-SEPARATED SHA-512 HASH
+ *  HYBRID POST-QUANTUM KDF (OpenSSL 3.x)
  *
- *  NOTE:
- *  This is NOT SHAKE256/KMAC and does not provide post-quantum
- *  cryptographic guarantees by itself. It is a custom construction
- *  based on SHA-512 and should not be treated as a replacement for
- *  standardized cryptographic primitives.
+ *  Construction:
+ *        X25519 shared secret  (32 bytes)
+ *                +
+ *        ML-KEM-768 shared secret (32 bytes)
+ *                |
+ *                v
+ *        HKDF-SHA-512
+ *            IKM  = "HYBRID-PQ-X25519-MLKEM768-v1" || X25519 || ML-KEM
+ *            salt = optional caller-supplied salt
+ *            info = domain || "BROWSER-HYBRID-PQ-AES256GCM-V1"
+ *                |
+ *                v
+ *        256-bit AES-GCM key
+ *
+ *  Requires OpenSSL 3.x (link with -lcrypto).
+ *  Compatible with the rest of this browser's GLib / security-console style.
  * ============================================================ */
 
-static void
-secure_domain_hash(const guint8 *input,
-                   gsize input_len,
-                   guint8 *output,
-                   gsize output_len,
-                   const gchar *domain_tag)
+#define HYBRID_AES_KEY_SIZE  32
+#define HYBRID_SECRET_SIZE   32
+#define HYBRID_MAX_DOMAIN_LEN 256
+
+static gboolean
+hybrid_pq_derive_aes256_key(
+    const guint8 *x25519_secret,
+    gsize         x25519_secret_len,
+    const guint8 *mlkem_secret,
+    gsize         mlkem_secret_len,
+    const guint8 *salt,
+    gsize         salt_len,
+    const gchar  *domain,
+    guint8        output_key[HYBRID_AES_KEY_SIZE])
 {
-    GChecksum *cs1 =
-        g_checksum_new(G_CHECKSUM_SHA512);
+    gboolean      success = FALSE;
+    EVP_KDF      *kdf     = NULL;
+    EVP_KDF_CTX  *kctx    = NULL;
+    guint8       *ikm     = NULL;
+    guint8       *info    = NULL;
+    gsize         ikm_len = 0;
+    gsize         info_len = 0;
 
-    if (domain_tag != NULL) {
-        g_checksum_update(
-            cs1,
-            (const guchar *)domain_tag,
-            strlen(domain_tag)
-        );
+    /* ---- 1. Parameter validation ---- */
+    if (x25519_secret == NULL || mlkem_secret == NULL ||
+        output_key == NULL || domain == NULL) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "NULL parameter passed to hybrid_pq_derive_aes256_key");
+        return FALSE;
     }
 
-    if (input != NULL && input_len > 0) {
-        g_checksum_update(
-            cs1,
-            input,
-            input_len
-        );
+    if (x25519_secret_len != HYBRID_SECRET_SIZE ||
+        mlkem_secret_len  != HYBRID_SECRET_SIZE) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "Invalid shared-secret length (expected 32 bytes)");
+        return FALSE;
     }
 
-    guint8 digest1[64];
-    gsize digest1_len = sizeof(digest1);
+    gsize domain_len = strlen(domain);
+    if (domain_len == 0 || domain_len > HYBRID_MAX_DOMAIN_LEN) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "Invalid domain length");
+        return FALSE;
+    }
 
-    g_checksum_get_digest(
-        cs1,
-        digest1,
-        &digest1_len
-    );
+    /* Always start with a clean output buffer on any failure path */
+    OPENSSL_cleanse(output_key, HYBRID_AES_KEY_SIZE);
 
-    g_checksum_free(cs1);
+    /* ---- 2. Build IKM = label || X25519_ss || ML-KEM_ss ---- */
+    static const char label[] = "HYBRID-PQ-X25519-MLKEM768-v1";
+    const gsize label_len = sizeof(label) - 1;
 
+    ikm_len = label_len + x25519_secret_len + mlkem_secret_len;
+    ikm = g_malloc(ikm_len);
+    if (ikm == NULL) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "Out of memory allocating IKM");
+        return FALSE;
+    }
+
+    gsize off = 0;
+    memcpy(ikm + off, label, label_len);                 off += label_len;
+    memcpy(ikm + off, x25519_secret, x25519_secret_len); off += x25519_secret_len;
+    memcpy(ikm + off, mlkem_secret,  mlkem_secret_len);
+
+    /* ---- 3. Build info = domain || protocol_id ---- */
+    static const guint8 protocol_id[] = "BROWSER-HYBRID-PQ-AES256GCM-V1";
+    const gsize proto_id_len = sizeof(protocol_id) - 1;
+
+    info_len = domain_len + proto_id_len;
+    info = g_malloc(info_len);
+    if (info == NULL) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "Out of memory allocating info");
+        goto cleanup;
+    }
+
+    memcpy(info, domain, domain_len);
+    memcpy(info + domain_len, protocol_id, proto_id_len);
+
+    /* ---- 4. OpenSSL 3.x HKDF-SHA-512 ---- */
+    kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    if (kdf == NULL) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "EVP_KDF_fetch(HKDF) failed");
+        goto cleanup;
+    }
+
+    kctx = EVP_KDF_CTX_new(kdf);
+    if (kctx == NULL) {
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "EVP_KDF_CTX_new failed");
+        goto cleanup;
+    }
 
     /*
-     * Second independent SHA-512 derivation.
+     * params[6] is required:
+     *   digest + key + [salt] + info + end
      */
-    GChecksum *cs2 =
-        g_checksum_new(G_CHECKSUM_SHA512);
+    OSSL_PARAM params[6];
+    int p = 0;
 
-    const guint64 domain_salt =
-        G_GUINT64_CONSTANT(0xDEADBEEFCAFE512);
+    static const char *md_name = "SHA512";
 
-    g_checksum_update(
-        cs2,
-        (const guchar *)&domain_salt,
-        sizeof(domain_salt)
-    );
+    params[p++] = OSSL_PARAM_construct_utf8_string(
+        OSSL_KDF_PARAM_DIGEST, (char *)md_name, 0);
 
-    g_checksum_update(
-        cs2,
-        digest1,
-        sizeof(digest1)
-    );
+    params[p++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_KEY, ikm, ikm_len);
 
-    g_checksum_update(
-        cs2,
-        (const guchar *)&input_len,
-        sizeof(input_len)
-    );
-
-    if (domain_tag != NULL) {
-        g_checksum_update(
-            cs2,
-            (const guchar *)domain_tag,
-            strlen(domain_tag)
-        );
+    if (salt != NULL && salt_len > 0) {
+        params[p++] = OSSL_PARAM_construct_octet_string(
+            OSSL_KDF_PARAM_SALT, (void *)salt, salt_len);
     }
 
-    guint8 digest2[64];
-    gsize digest2_len = sizeof(digest2);
+    params[p++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_INFO, info, info_len);
 
-    g_checksum_get_digest(
-        cs2,
-        digest2,
-        &digest2_len
-    );
+    params[p++] = OSSL_PARAM_construct_end();
 
-    g_checksum_free(cs2);
-
-
-    /*
-     * Expand output deterministically.
-     */
-    for (gsize i = 0; i < output_len; ++i) {
-        output[i] =
-            digest1[i % 64] ^
-            digest2[i % 64] ^
-            (guint8)((i * 31u) & 0xffu);
+    /* ---- 5. Derive ---- */
+    if (EVP_KDF_derive(kctx, output_key, HYBRID_AES_KEY_SIZE, params) <= 0) {
+        OPENSSL_cleanse(output_key, HYBRID_AES_KEY_SIZE);
+        log_security_event(SEC_EVENT_VIOLATION,
+                           "Hybrid-PQ-KDF",
+                           "EVP_KDF_derive failed");
+        goto cleanup;
     }
+
+    success = TRUE;
+
+cleanup:
+    if (ikm) {
+        OPENSSL_cleanse(ikm, ikm_len);
+        g_free(ikm);
+    }
+    if (info) {
+        OPENSSL_cleanse(info, info_len);
+        g_free(info);
+    }
+    if (kctx)
+        EVP_KDF_CTX_free(kctx);
+    if (kdf)
+        EVP_KDF_free(kdf);
+
+    return success;
 }
 
 
