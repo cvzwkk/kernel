@@ -1,6 +1,4 @@
-# Building Hardened Kernel Zero Trust Architecture (ZTA)
-
-![](https://quicklaunch.io/wp-content/uploads/2021/11/Zero-trust-1.png)    
+# Building Hardened Kernel Zero Trust Architecture (ZTA)   
 
 - The Bootstrap to one complet builder of ZTA   
    Required more research about the theme to improve the configuration and parameters
