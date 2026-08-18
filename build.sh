@@ -9,19 +9,41 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Configuration Variables
 # ------------------------------------------------------------------------------
-KERNEL_VERSION="6.12"
+KERNEL_VERSION="6.6.151"
 KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-KERNEL_SIGN="linux-${KERNEL_VERSION}.tar.sign"
 BASE_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x"
 BUILD_DIR="$(pwd)/kernel_build"
-KEYS_DIR="${BUILD_DIR}/keys"
 SRC_DIR="${BUILD_DIR}/linux-${KERNEL_VERSION}"
+KEYS_DIR="${BUILD_DIR}/keys"
 
 # Torvalds & Stable Release PGP Key Fingerprints
 PGP_KEYS=(
   "ABAF11C65A2970B130ABE3C479BE3E4300411886" # Linus Torvalds
   "647F28654894E3BD457199BE38DBBDC86092693E" # Greg Kroah-Hartman
 )
+
+# Inline PGP Signature provided for linux-6.6.151 (.tar version)
+read -r -d '' KERNEL_SIG_DATA << 'EOF' || true
+-----BEGIN PGP SIGNATURE-----
+Comment: This signature is for the .tar version of the archive
+Comment: git archive --format tar --prefix=linux-6.6.151/ v6.6.151
+Comment: git version 2.55.0
+
+iQIzBAABCgAdFiEEZH8oZUiU471FcZm+ONu9yGCSaT4FAmp4xYAACgkQONu9yGCS
+aT4ERhAAiEKckujE3K5hZ2aQCyDK1O1hGL0YbBUgS7JPa9ddyKEUfGX8tmYFkwCx
+7LFcijHfQvOvo+XBx2DOq3zMwmg8z44eau6snM5Lpc7PD+wzqr4WKP+Y0t2dTaLX
+j6BWnQFAV4qtjEjm+lCxV5FjlDVBjh6PJ18u2aX7gYG9OxAx26rvgCC7FYpObb2G
+lBD7xOvIGdxD4GldB+i+fC6p17I1QH6Eh85kU6BtfuSEXSVKd50MlxN5jKirEfoM
+3sBT2V+4wejcbSOgZPk8EIU1MJT/AjkS6yjIJS6UUbK7ju+9WwFEmonfhHDWP1kG
+r5H/PQJ8A8Dl4a0isPWtHOKry2IrWU/Cz32L3qJLzP9z4MrWse5o2tWnR92zDQvX
+mFd8E+o4mQbUO4DCsAmfEYXZyuV5pp+ACBjtkoWiFNpdH9QPdOnBzE+F5uEhj3x7
+UXuFpX0UOZcAcaIcu+z809RHQUrflavbif01Qxmhxqs2+7UdKsKBNNiTfwUKSjnk
+uOlAuxQuhdTjocADMLY1i5SEMlOUCQF+i57lRLZ9mI9njEznofIaV1w17RqYtwb7
+L9ChIXnHW+0vvU/6ny4/9GyiWeKgBqcpGrLOOFA690nQRebUbw+XAmotU2uTaWuZ
+MM0lT/V6rm9gj5AO9LHoLVUrOT6vnG4+eHG3MegT1axZnRSXwDY=
+=FXro
+-----END PGP SIGNATURE-----
+EOF
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -32,7 +54,7 @@ log_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 
 check_dependencies() {
     log_info "Verifying required build toolchain and security utilities..."
-    local deps=(wget xz gpg make gcc flex bison bc libssl-dev libelf-dev sbsigntool openssl dwarves)
+    local deps=(wget xz gpg make gcc flex bison bc libssl-dev libelf-dev sbsigntool openssl dwarves libncurses-dev)
     for cmd in "${deps[@]}"; do
         if ! dpkg -s "$cmd" >/dev/null 2>&1 && ! command -v "$cmd" >/dev/null 2>&1; then
             log_warn "Missing dependency: $cmd. Attempting installation..."
@@ -49,22 +71,25 @@ setup_workspace() {
     cd "${BUILD_DIR}"
 
     if [ ! -f "${KERNEL_TARBALL}" ]; then
-        log_info "Downloading Linux Kernel v${KERNEL_VERSION} source and signature..."
+        log_info "Downloading Linux Kernel v${KERNEL_VERSION} source..."
         wget -q --show-progress "${BASE_URL}/${KERNEL_TARBALL}"
-        wget -q --show-progress "${BASE_URL}/${KERNEL_SIGN}"
     fi
 
-    log_info "Importing Kernel Maintainer PGP Keys..."
-    gpg --batch --quiet --receive-keys "${PGP_KEYS[@]}" || true
+    log_info "Importing Kernel Maintainer PGP Keys via WKD and fallback keyservers..."
+    gpg --batch --quiet --locate-keys torvalds@kernel.org gregkh@kernel.org || \
+    gpg --batch --quiet --keyserver hkps://keys.openpgp.org --recv-keys "${PGP_KEYS[@]}" || \
+    gpg --batch --quiet --keyserver hkp://keyserver.ubuntu.com --recv-keys "${PGP_KEYS[@]}" || \
+        log_warn "Key reception warning: Continuing with local keyring check."
 
     log_info "Verifying PGP cryptographic signature of the source archive..."
-    xzcat "${KERNEL_TARBALL}" | gpg --batch --verify "${KERNEL_SIGN}" - || \
+    echo "${KERNEL_SIG_DATA}" > "${BUILD_DIR}/kernel.sig"
+    
+    xzcat "${KERNEL_TARBALL}" | gpg --batch --verify "${BUILD_DIR}/kernel.sig" - || \
         log_error "PGP Signature verification failed! Source compromised."
 
     log_info "Extracting kernel source code..."
     rm -rf "${SRC_DIR}"
     tar -xf "${KERNEL_TARBALL}"
-    cd "${SRC_DIR}"
 }
 
 # ------------------------------------------------------------------------------
@@ -73,28 +98,39 @@ setup_workspace() {
 generate_keys() {
     log_info "Generating local X.509 Secure Boot and Kernel Module signing keypair..."
     
+    mkdir -p "${SRC_DIR}/certs"
+
     if [ ! -f "${KEYS_DIR}/DB.key" ]; then
-        openssl req -new -x509 -newkey rsa:4096 -nodes \
-            -keyout "${KEYS_DIR}/DB.key" \
+        # Generate traditional PKCS#1 private key required by kernel extract-cert
+        openssl genrsa -out "${KEYS_DIR}/DB.key.tmp" 4096
+        openssl rsa -in "${KEYS_DIR}/DB.key.tmp" -out "${KEYS_DIR}/DB.key"
+        rm -f "${KEYS_DIR}/DB.key.tmp"
+
+        # Generate self-signed X.509 certificate using the key
+        openssl req -new -x509 -days 3650 -key "${KEYS_DIR}/DB.key" \
             -out "${KEYS_DIR}/DB.crt" \
-            -days 3650 \
             -subj "/CN=Zero Trust Custom Kernel Signing Key/"
+            
         chmod 600 "${KEYS_DIR}/DB.key"
     else
         log_info "Existing keys found in ${KEYS_DIR}, skipping generation."
     fi
+
+    # Copy keys directly into kernel source certs directory for clean compilation linkage
+    cp "${KEYS_DIR}/DB.key" "${SRC_DIR}/certs/signing_key.pem"
+    cp "${KEYS_DIR}/DB.crt" "${SRC_DIR}/certs/signing_key.x509"
 }
 
 # ------------------------------------------------------------------------------
 # Step 3: Hardened Config Injection
 # ------------------------------------------------------------------------------
 configure_kernel() {
+    cd "${SRC_DIR}"
     log_info "Generating default baseline configuration..."
     make defconfig
 
     log_info "Injecting Zero-Trust Hardening & Exploitation Mitigation Flags..."
 
-    # Script helper function to modify .config
     set_cfg() {
         local option=$1
         local value=$2
@@ -149,7 +185,10 @@ configure_kernel() {
     enable_cfg  CONFIG_MODULE_SIG_ALL
     enable_cfg  CONFIG_MODULE_SIG_SHA512
     str_cfg     CONFIG_MODULE_SIG_HASH "sha512"
-    str_cfg     CONFIG_MODULE_SIG_KEY "${KEYS_DIR}/DB.key"
+    str_cfg     CONFIG_MODULE_SIG_KEY "certs/signing_key.pem"
+    
+    str_cfg     CONFIG_SYSTEM_TRUSTED_KEYS ""
+    str_cfg     CONFIG_SYSTEM_REVOCATION_KEYS ""
 
     # --- Block Integrity ---
     enable_cfg  CONFIG_BLK_DEV_DM
@@ -206,15 +245,22 @@ configure_kernel() {
 # Step 4: Pure Source Compilation
 # ------------------------------------------------------------------------------
 compile_kernel() {
+    cd "${SRC_DIR}"
     log_info "Compiling Linux Kernel v${KERNEL_VERSION} from pure source..."
     local threads
     threads=$(nproc)
     
-    make -j"${threads}" bzImage
+    if ! make -j"${threads}" bzImage; then
+        log_warn "Parallel compilation encountered an issue. Rerunning sequentially (-j1) to isolate error..."
+        make -j1 bzImage || log_error "Kernel compilation failed."
+    fi
     
     if grep -q "CONFIG_MODULES=y" .config; then
         log_info "Building kernel modules..."
-        make -j"${threads}" modules
+        if ! make -j"${threads}" modules; then
+            log_warn "Parallel module compilation failed. Rerunning sequentially (-j1)..."
+            make -j1 modules || log_error "Kernel modules compilation failed."
+        fi
     fi
 }
 
@@ -222,6 +268,7 @@ compile_kernel() {
 # Step 5: Secure Boot Binary Signing
 # ------------------------------------------------------------------------------
 sign_kernel() {
+    cd "${SRC_DIR}"
     log_info "Signing the compiled bzImage for UEFI Secure Boot enforcement..."
     
     local target_img="arch/x86/boot/bzImage"
