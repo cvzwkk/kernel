@@ -12,3 +12,7 @@ cd sudo
 make
 sudo make install
 sudo -V
+sudo useradd -m -s /bin/bash guest
+sudo passwd guest
+sudo chmod 700 /home/guest
+sudo passwd -l root
