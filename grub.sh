@@ -49,8 +49,8 @@ echo "[+] Creating custom GRUB security rules in $SECURITY_SNIPPET..."
 cat << EOF > "$SECURITY_SNIPPET"
 #!/bin/sh
 exec tail -n +3 \$0
-set superusers="admin"
-password_pbkdf2 admin $HASHED_PASS
+set superusers="root"
+password_pbkdf2 root $HASHED_PASS
 EOF
 
 chmod +x "$SECURITY_SNIPPET"
