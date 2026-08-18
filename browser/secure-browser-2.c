@@ -1,3 +1,12 @@
+/* gcc -O2 -Wall -Wextra -Wpedantic \
+    -D_FORTIFY_SOURCE=3 \
+    -fstack-protector-strong \
+    -fPIE -pie \
+    -Wl,-z,relro,-z,now \
+    -o secure_browser secure_browser.c \
+    $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1) \
+    -lcrypto
+
 /*
  * secure_browser.c
  *
